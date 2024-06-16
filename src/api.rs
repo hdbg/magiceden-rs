@@ -1,11 +1,15 @@
+use async_tungstenite::tokio::TokioAdapter;
+use async_tungstenite::tungstenite::client::IntoClientRequest;
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::WebSocketStream;
 use chromimic as reqwest;
 use chromimic::Client;
 use proxied::Proxy;
+use reqwest::impersonate::Impersonate;
 use rust_decimal::prelude::*;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use std::sync::Arc;
 use std::time::{self, Duration};
 use tokio::time::sleep;
 use tracing::info;
@@ -27,27 +31,34 @@ use futures::stream::Stream;
 use futures::{SinkExt, StreamExt};
 
 pub struct MagicEdenWS {
-    ws: WebSocketStream<async_tungstenite::tokio::TokioAdapter<tokio::net::TcpStream>>,
+    ws: socky::WebSocket,
     ping_interval: tokio::time::Interval,
 
     subscriptions: Vec<serde_json::Value>,
 }
 
 impl MagicEdenWS {
-    async fn connect(
-        token: String,
-    ) -> WebSocketStream<async_tungstenite::tokio::TokioAdapter<tokio::net::TcpStream>> {
+    async fn connect(token: String, proxy: Option<Proxy>) -> socky::WebSocket {
         let url = format!("wss://wss-mainnet.magiceden.io/{}", token);
 
-        let (ws_stream, _) = async_tungstenite::tokio::connect_async(url)
-            .await
-            .expect("Failed to connect to WebSocket");
+        let ws = match proxy {
+            Some(proxy) => {
+                socky::WebSocket::new_proxy(
+                    proxy,
+                    "wss-mainnet.magiceden.io".to_string(),
+                    443,
+                    url.into_client_request().unwrap(),
+                )
+                .await
+            }
+            None => socky::WebSocket::new(url.into_client_request().unwrap()).await,
+        };
 
-        return ws_stream;
+        return ws.unwrap();
     }
 
-    async fn new(token: String) -> Self {
-        let ws = Self::connect(token).await;
+    async fn new(token: String, proxy: Option<Proxy>) -> Self {
+        let ws = Self::connect(token, proxy).await;
         Self {
             ws,
             ping_interval: tokio::time::interval(std::time::Duration::from_secs(15)),
@@ -67,18 +78,38 @@ impl MagicEdenWS {
             .send(Message::Text(serde_json::to_string(&msg).unwrap()))
             .await
         {
-            info!("Failed to send subscription message: {:?}", err);
+            panic!("Failed to send subscription message: {:?}", err);
         }
     }
 
     pub async fn recv(&mut self) -> Option<serde_json::Value> {
-        if let Some(Ok(msg)) = self.ws.next().await {
-            if msg == Message::Text("ping".to_string()) {
-                return None;
-            }
+        let mut socket_ping_interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                _ = self.ping_interval.tick() => {
+                    if let Err(err) = self.ws.send(Message::Text("[\"pong\"]".to_string())).await {
+                        panic!("Failed to send ping message: {:?}", err);
+                    }
+                }
+                _ = socket_ping_interval.tick() => {
+                    self.ws.send(Message::Ping(Vec::new())).await.unwrap();
+                }
+                msg = self.ws.next() => {
+                    if let Some(Ok(msg)) = msg {
+                        if msg.is_ping() {
+                            self.ws.send(Message::Pong(Vec::new())).await.unwrap();
+                            continue;
+                        }
+                        if msg == Message::Text("ping".to_string()) {
+                            continue;
+                        }
 
-            if let Ok(msg_json) = serde_json::from_str(&msg.to_string()) {
-                return Some(msg_json);
+                        if let Ok(msg_json) = serde_json::from_str(&msg.to_string()) {
+                            return Some(msg_json);
+                        }
+                    }
+                }
+
             }
         }
 
@@ -87,14 +118,28 @@ impl MagicEdenWS {
 }
 
 pub struct MagicEdenSDK {
-    keypair: Keypair,
+    keypair: Arc<Keypair>,
     session: Client,
-    impersonate: Option<String>,
+    impersonate: Impersonate,
     token: Option<String>,
-    proxy: Option<String>,
+    proxy: Option<Proxy>,
 }
 
 impl MagicEdenSDK {
+    pub fn new(
+        keypair: Arc<Keypair>,
+        client: Client,
+        impersonate: Impersonate,
+        proxy: Option<Proxy>,
+    ) -> Self {
+        Self {
+            keypair,
+            session: client,
+            impersonate,
+            token: None,
+            proxy,
+        }
+    }
     async fn _request_challenge(&self) -> serde_json::Value {
         let body = serde_json::json!({
             "address": self.keypair.pubkey().to_string(),
@@ -138,42 +183,65 @@ impl MagicEdenSDK {
             "wallet_name": "Phantom",
         });
 
+        println!("{}", body.to_string());
+
         let resp = self
             .session
             .post("https://api-mainnet.magiceden.io/auth/login/v2/verify?chainId=solana-mainnet")
-            .header(
-                "authorization",
-                format!("Bearer {}", self.token.as_ref().unwrap()),
-            )
+            .header("accept", "application/json, text/plain, */*")
+            .header("authorization", "Bearer null")
+            .header("content-type", "application/json")
+            .header("dnt", "1")
+            .header("origin", "https://magiceden.io")
+            .header("priority", "u=1, i")
+            .header("referer", "https://magiceden.io/")
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", "\"Windows\"")
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-site")
             .json(&body)
             .send()
             .await
             .expect("Failed to send request");
 
         let status = resp.status();
-        let json_resp: serde_json::Value =
-            resp.json().await.expect("Failed to parse JSON response");
 
-        (status.is_success(), json_resp["token"].to_string())
+        println!("{:?}", status);
+
+        let text = resp.text().await.expect("Failed to parse JSON response");
+
+        println!("{}", text);
+
+        let json_resp: serde_json::Value =
+            serde_json::from_str(&text).expect("Failed to parse JSON response");
+
+        (
+            status.is_success(),
+            json_resp["token"].as_str().unwrap().to_string(),
+        )
     }
 
     pub async fn auth(&mut self) {
         let challenge = self._request_challenge().await;
-        let challenge_bytes: Vec<u8> =
-            serde_json::from_value(challenge["message"].clone()).unwrap();
+        println!("{}", challenge.to_string());
+        let challenge_bytes: String = serde_json::from_value(challenge["message"].clone()).unwrap();
+        let challenge_bytes = challenge_bytes.as_bytes();
         let signature = self.keypair.sign_message(&challenge_bytes).to_string();
 
         let (auth_result, token) = self
             ._verify_challenge(
                 &signature,
-                &challenge["nonce"].to_string(),
-                &challenge["token"].to_string(),
+                &challenge["nonce"].as_str().unwrap(),
+                &challenge["token"].as_str().unwrap(),
             )
             .await;
 
         if !auth_result {
             panic!("Unsuccessful authorization");
         }
+
+        println!("{}", token);
 
         self.token = Some(token);
     }
@@ -199,11 +267,12 @@ impl MagicEdenSDK {
     }
 
     pub async fn ws(&self) -> MagicEdenWS {
-        let socket = MagicEdenWS::new(self.get_ws_token().await).await;
+        let socket = MagicEdenWS::new("".to_owned(), self.proxy.clone()).await;
         socket
     }
 
     async fn get_ws_token(&self) -> String {
+        println!("{}", format!("Bearer {}", self.token.as_ref().unwrap()));
         let resp = self
             .session
             .get("https://api-mainnet.magiceden.io/oauth/encryptedToken")
@@ -222,49 +291,44 @@ impl MagicEdenSDK {
             .header("sec-fetch-dest", "empty")
             .header("sec-fetch-mode", "cors")
             .header("sec-fetch-site", "same-site")
+            .header("User-Agent", self.session.user_agent().unwrap())
             .send()
             .await
             .expect("Failed to send request");
 
+        println!("{:?}", resp.status());
+
+        let text = resp.text().await.expect("Failed to parse JSON response");
+
+        println!("{}", text);
+
         let resp_json: serde_json::Value =
-            resp.json().await.expect("Failed to parse JSON response");
+            serde_json::from_str(&text).expect("Failed to parse JSON response");
 
         resp_json["token"].to_string()
     }
 
     pub fn default_pool_opts() -> serde_json::Value {
-        serde_json::json!({
-            "showInvalid": "false",
-            "limit": 150,
-            "offset": 0,
-            "filterOnSide": 1,
-            "hideExpired": "true",
-            "fundingMode": 0,
-            "direction": 1,
-            "field": 5,
-            "attributesMode": 0,
-            "attributes": [],
-            "enableSNS": "true",
-        })
+        serde_json::json!({})
     }
 
-    pub async fn get_pools(
-        &self,
-        slug: Option<&str>,
-        opts: serde_json::Value,
-    ) -> serde_json::Value {
+    pub async fn get_pools(&self, slug: &str) -> serde_json::Value {
         let endpoint = "https://api-mainnet.magiceden.io/v2/mmm/pools";
-        let mut params = opts;
 
-        if let Some(slug) = slug {
-            params["collectionSymbol"] = serde_json::json!(slug);
-        }
-
-        for (key, value) in Self::default_pool_opts().as_object().unwrap() {
-            if !params.as_object().unwrap().contains_key(key) {
-                params[key] = value.clone();
-            }
-        }
+        let params = vec![
+            ("showInvalid", "false"),
+            ("limit", "150"),
+            ("offset", "0"),
+            ("filterOnSide", "1"),
+            ("hideExpired", "true"),
+            ("fundingMode", "0"),
+            ("direction", "1"),
+            ("field", "5"),
+            ("attributesMode", "0"),
+            ("attributes", "[]"),
+            ("enableSNS", "true"),
+            ("collectionSymbol", slug),
+        ];
 
         let resp = self
             .session
@@ -281,37 +345,37 @@ impl MagicEdenSDK {
         resp.json().await.expect("Failed to parse JSON response")
     }
 
-    fn create_pool_opts_default() -> serde_json::Value {
-        serde_json::json!({
-            "curveType": "exp",
-            "curveDelta": 0,
-            "reinvestBuy": "false",
-            "reinvestSell": "false",
-            "lpFeeBp": 0,
-            "buysideCreatorRoyaltyBp": 0,
-        })
-    }
-
     async fn create_pool_custom(
         &self,
         slug: &str,
-        spot_price: f64,
+        spot_price: Decimal,
         expiry: ExpiryTime,
-        opts: serde_json::Value,
     ) -> serde_json::Value {
-        let mut params = opts;
-        params["collectionSymbol"] = serde_json::json!(slug);
-        params["owner"] = serde_json::json!(self.keypair.pubkey().to_string());
-        params["spotPrice"] = serde_json::json!(spot_price);
-        params["solDeposit"] = serde_json::json!(spot_price);
-        params["paymentMint"] = serde_json::json!("11111111111111111111111111111111");
-        params["expiry"] = serde_json::json!(
-            time::SystemTime::now()
+        let mut params = vec![
+            ("curveType", String::from("exp")),
+            ("curveDelta", String::from("0")),
+            ("reinvestBuy", String::from("false")),
+            ("reinvestSell", String::from("false")),
+            ("lpFeeBp", String::from("0")),
+            ("buysideCreatorRoyaltyBp", String::from("0")),
+        ];
+        params.push(("collectionSymbol", String::from(slug)));
+        params.push(("owner", self.keypair.pubkey().to_string()));
+        params.push(("spotPrice", spot_price.to_string()));
+        params.push(("solDeposit", spot_price.to_string()));
+        params.push((
+            "paymentMint",
+            String::from("11111111111111111111111111111111"),
+        ));
+        params.push((
+            "expiry",
+            (time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs()
-                + expiry as u64
-        );
+                + expiry as u64)
+                .to_string(),
+        ));
 
         let url = "https://api-mainnet.magiceden.io/v2/instructions/mmm/create-pool";
 
@@ -333,31 +397,78 @@ impl MagicEdenSDK {
     pub async fn create_escrow_pool(
         &self,
         slug: &str,
-        spot_price: f64,
+        spot_price: Decimal,
         expiry: ExpiryTime,
-        opts: serde_json::Value,
     ) -> serde_json::Value {
-        self.create_pool_custom(slug, spot_price, expiry, opts.clone())
+        let mut params = vec![
+            ("curveType", String::from("exp")),
+            ("curveDelta", String::from("0")),
+            ("reinvestBuy", String::from("false")),
+            ("reinvestSell", String::from("false")),
+            ("lpFeeBp", String::from("0")),
+            ("buysideCreatorRoyaltyBp", String::from("0")),
+            ("sharedEscrowCount", String::from("1")),
+        ];
+        params.push(("collectionSymbol", String::from(slug)));
+        params.push(("owner", self.keypair.pubkey().to_string()));
+        params.push(("spotPrice", spot_price.to_string()));
+        params.push(("solDeposit", spot_price.to_string()));
+        params.push((
+            "paymentMint",
+            String::from("11111111111111111111111111111111"),
+        ));
+        params.push((
+            "expiry",
+            (time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + expiry as u64)
+                .to_string(),
+        ));
+
+        let url = "https://api-mainnet.magiceden.io/v2/instructions/mmm/create-pool";
+
+        let resp = self
+            .session
+            .get(url)
+            .query(&params)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.token.as_ref().unwrap()),
+            )
+            .send()
             .await
+            .expect("Failed to send request");
+
+        resp.json().await.expect("Failed to parse JSON response")
     }
 
     pub async fn edit_pool_custom(
         &self,
         pool: &str,
-        spot_price: f64,
+        spot_price: Decimal,
         expiry: ExpiryTime,
-        opts: serde_json::Value,
     ) -> serde_json::Value {
-        let mut params = opts;
-        params["spotPrice"] = serde_json::json!(spot_price);
-        params["expiry"] = serde_json::json!(
-            time::SystemTime::now()
-                .duration_since(time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                + expiry as u64
-        );
-        params["pool"] = serde_json::json!(pool);
+        let mut params = vec![
+            ("curveType", String::from("exp")),
+            ("curveDelta", String::from("0")),
+            ("reinvestBuy", String::from("false")),
+            ("reinvestSell", String::from("false")),
+            ("lpFeeBp", String::from("0")),
+            ("buysideCreatorRoyaltyBp", String::from("0")),
+            ("spotPrice", spot_price.to_string()),
+            (
+                "expiry",
+                (time::SystemTime::now()
+                    .duration_since(time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + expiry as u64)
+                    .to_string(),
+            ),
+            ("pool", String::from(pool)),
+        ];
 
         let url = "https://api-mainnet.magiceden.io/v2/instructions/mmm/update-pool";
 
@@ -379,12 +490,45 @@ impl MagicEdenSDK {
     pub async fn edit_pool_escrow(
         &self,
         pool: &str,
-        spot_price: f64,
+        spot_price: Decimal,
         expiry: ExpiryTime,
-        opts: serde_json::Value,
     ) -> serde_json::Value {
-        self.edit_pool_custom(pool, spot_price, expiry, opts.clone())
+        let mut params = vec![
+            ("curveType", String::from("exp")),
+            ("curveDelta", String::from("0")),
+            ("reinvestBuy", String::from("false")),
+            ("reinvestSell", String::from("false")),
+            ("lpFeeBp", String::from("0")),
+            ("buysideCreatorRoyaltyBp", String::from("0")),
+            ("spotPrice", spot_price.to_string()),
+            (
+                "expiry",
+                (time::SystemTime::now()
+                    .duration_since(time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + expiry as u64)
+                    .to_string(),
+            ),
+            ("pool", String::from(pool)),
+            ("sharedEscrowCount", String::from("1")),
+        ];
+
+        let url = "https://api-mainnet.magiceden.io/v2/instructions/mmm/update-pool";
+
+        let resp = self
+            .session
+            .get(url)
+            .query(&params)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.token.as_ref().unwrap()),
+            )
+            .send()
             .await
+            .expect("Failed to send request");
+
+        resp.json().await.expect("Failed to parse JSON response")
     }
 
     pub async fn cancel_offer(&self, pool_key: &str, amount: Decimal) -> serde_json::Value {

@@ -1,3 +1,5 @@
+use std::future::IntoFuture;
+
 pub mod api;
 pub mod bot {
 
@@ -9,9 +11,20 @@ pub mod bot {
     use crate::api::*;
     use async_tungstenite::tungstenite::Message;
     use async_tungstenite::WebSocketStream;
+    use chromimic::boring::x509;
+    use chromimic::impersonate::Impersonate;
     use futures::stream::StreamExt;
+    use proxied::Proxy;
+    use rust_decimal::prelude::FromPrimitive;
     use rust_decimal::Decimal;
+    use serde::Deserialize;
     use serde_json::json;
+    use solana_client::nonblocking::rpc_client::RpcClient;
+    use solana_client::rpc_client::RpcClientConfig;
+    use solana_client::rpc_config::RpcSendTransactionConfig;
+    use solana_rpc_client::http_sender::HttpSender;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::signature::Keypair;
     use solana_sdk::signer::Signer;
     use solana_sdk::transaction::{Transaction, VersionedTransaction};
     use tokio::task;
@@ -50,23 +63,32 @@ pub mod bot {
         Decimal::from(x) * Decimal::from_scientific("1e-9").unwrap()
     }
 
-    struct Config {
+    #[serde_with::serde_as]
+    #[derive(Deserialize, Debug, Clone)]
+    pub struct StrProxy(#[serde_as(as = "DisplayFromStr")] Proxy);
+
+    use serde_with::{DeserializeFromStr, DisplayFromStr};
+    #[serde_with::serde_as]
+    #[derive(Debug, serde::Deserialize)]
+    pub struct Config {
         pk: String,
         slugs: Vec<String>,
-        impersonate: String,
-        min_top_bids: i32,
+        #[serde_as(as = "DisplayFromStr")]
+        impersonate: Impersonate,
+        min_top_bids: u32,
         rpc: String,
         inclusive: bool,
-        min_top_bids_override: HashMap<String, i32>,
-        proxy: Option<String>,
+        min_top_bids_override: HashMap<String, u32>,
+        proxy: Option<StrProxy>,
     }
 
-    struct Bot {
+    pub struct Bot {
+        keypair: Arc<Keypair>,
         sdk: MagicEdenSDK,
         ws: MagicEdenWS,
         rpc: RpcClient,
         config: Config,
-        my_bids: HashMap<String, Option<Decimal>>,
+        my_bids: HashMap<String, Option<(Decimal, String)>>,
         cached_pools: HashMap<String, Vec<serde_json::Value>>,
         escrow_balance: Decimal,
     }
@@ -89,214 +111,333 @@ pub mod bot {
                 let current_bid = self.my_bids.get(slug).unwrap_or(&None);
                 let current_bid_value = current_bid.as_ref();
 
-                if current_bid_value == calc_result.as_ref() {
+                if current_bid_value.as_ref().map(|x| &x.0) == calc_result.as_ref() {
                     continue;
                 }
 
                 let transaction_obj = match (current_bid_value, calc_result) {
                     (None, Some(new_bid)) => {
                         info!("Creating new bid on {} for {}", slug, new_bid);
-                        self.sdk.create_escrow_pool(slug, new_bid.to_string()).await
+                        self.sdk
+                            .create_escrow_pool(slug, new_bid, ExpiryTime::Day)
+                            .await
                     }
                     (Some(_), None) => {
                         info!("Cancelling bid on {}", slug);
                         let current_bid = current_bid.as_ref().unwrap();
-                        self.sdk
-                            .cancel_offer_escrow(current_bid.pool_key.clone())
-                            .await
+                        self.sdk.cancel_offer_escrow(&current_bid.1).await
                     }
                     (Some(old_bid), Some(new_bid)) => {
-                        info!("Changing bid on {} {}=>{}", slug, old_bid, new_bid);
+                        info!("Changing bid on {} {}=>{}", slug, old_bid.0, new_bid);
                         let current_bid = current_bid.as_ref().unwrap();
                         self.sdk
-                            .edit_pool_escrow(current_bid.pool_key.clone(), new_bid.to_string())
+                            .edit_pool_escrow(&current_bid.1, new_bid, ExpiryTime::Day)
                             .await
                     }
                     _ => continue,
                 };
 
-                let transaction = Transaction::from_bytes(&transaction_obj.tx_signed.data);
-                let blockhash = Hash::from_string(&transaction_obj.blockhash_data.blockhash);
-                let blockheight = transaction_obj.blockhash_data.last_valid_block_height;
+                let mut transaction: Transaction = bincode::deserialize(
+                    &transaction_obj["txSigned"]["data"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_u64().unwrap() as u8)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )
+                .unwrap();
+                let blockhash = Hash::from_str(
+                    &transaction_obj["blockhashData"]["blockhash"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let blockheight = transaction_obj["blockhashData"]["lastValidBlockHeight"]
+                    .as_u64()
+                    .unwrap();
 
                 let keypair = self.keypair.clone();
-                let transaction = transaction.sign(&[&keypair], &blockhash);
+                transaction.sign(&[&keypair], blockhash);
 
-                let transaction = VersionedTransaction::from_legacy(transaction);
-
-                let opts = TxOpts {
-                    skip_preflight: true,
-                    skip_confirmation: false,
-                    preflight_commitment: "confirmed".to_string(),
-                    last_valid_block_height: blockheight,
-                    max_retries: 10,
-                };
-
-                self.rpc
-                    .send_transaction(&transaction, &opts)
+                let hash = self
+                    .rpc
+                    .send_transaction_with_config(
+                        &transaction,
+                        RpcSendTransactionConfig {
+                            skip_preflight: true,
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .expect("Failed to send transaction");
 
-                if let Some(pool_key) = transaction_obj.pool_key {
+                self.rpc.confirm_transaction(&hash).await.unwrap();
+
+                if let Some(pool_key) = transaction_obj["poolKey"].as_str() {
                     self.my_bids.insert(
                         slug.clone(),
-                        Some(json!({"poolKey": pool_key, "spotPrice": })),
+                        Some((calc_result.unwrap(), pool_key.to_string())),
                     );
-                } else if let Some(bid) = self.my_bids.get_mut(slug) {
-                    bid.as_mut().unwrap().spot_price = calc_result;
+                } else {
+                    match calc_result {
+                        Some(new_bid) => {
+                            self.my_bids.get_mut(slug).unwrap().as_mut().unwrap().0 = new_bid;
+                        }
+                        None => {
+                            self.my_bids.insert(slug.clone(), None);
+                        }
+                    }
                 }
 
                 info!("OK!");
             }
         }
 
-        fn process_update(&mut self, msg: &Box) {
-            if msg.name != "fullUpdate" {
+        fn process_update(&mut self, msg: &serde_json::Value) {
+            if msg["name"].as_str() != Some("fullUpdate") {
                 return;
             }
 
-            let state = &msg.pool_state;
-            let new_pool = state.clone();
+            match msg["name"].as_str() {
+                Some("fullUpdate") => {
+                    let state = &msg["poolState"];
+                    let new_pool = state.clone();
 
-            if state.pool_type == "invalid" || state.buy_orders_amount < 1 {
-                self.cached_pools
-                    .get_mut(&state.collection_symbol)
-                    .map(|pools| {
-                        if let Some(index) = pools
-                            .iter()
-                            .position(|pool| pool["poolKey"].as_str() == state.pool_key)
-                        {
+                    if state["poolType"].as_str() == Some("invalid")
+                        || state["buyOrdersAmount"].as_i64() < Some(1)
+                    {
+                        self.cached_pools
+                            .get_mut(&(state["collectionSymbol"].as_str().unwrap().to_string()))
+                            .map(|pools| {
+                                if let Some(index) = pools.iter().position(|pool| {
+                                    pool["poolKey"].as_str() == state["poolKey"].as_str()
+                                }) {
+                                    debug!(
+                                        "Deleted pool {} from {}",
+                                        state["poolKey"].as_str().unwrap(),
+                                        state["collectionSymbol"].as_str().unwrap()
+                                    );
+                                    pools.remove(index);
+                                }
+                            });
+                        return;
+                    }
+
+                    let present_index = self
+                        .cached_pools
+                        .get(&(state["collectionSymbol"].as_str().unwrap().to_string()))
+                        .and_then(|pools| {
+                            pools.iter().position(|pool| {
+                                pool["poolKey"].as_str().unwrap()
+                                    == state["poolKey"].as_str().unwrap()
+                            })
+                        });
+
+                    match present_index {
+                        None => {
                             debug!(
-                                "Deleted pool {} from {}",
-                                state.pool_key, state.collection_symbol
+                                "Added pool {} from {}",
+                                state["poolKey"].as_str().unwrap(),
+                                state["collectionSymbol"].as_str().unwrap()
                             );
-                            pools.remove(index);
+                            self.cached_pools
+                                .entry(state["collectionSymbol"].as_str().unwrap().to_string())
+                                .or_insert_with(Vec::new)
+                                .push(new_pool);
                         }
-                    });
-                return;
+                        Some(old) => {
+                            self.cached_pools
+                                .get_mut(&(state["collectionSymbol"].as_str().unwrap().to_string()))
+                                .map(|pools| pools[old] = new_pool);
+                            debug!(
+                                "Changed pool {} from {}",
+                                state["poolKey"].as_str().unwrap(),
+                                state["collectionSymbol"].as_str().unwrap()
+                            );
+                        }
+                    }
+
+                    self.cached_pools
+                        .get_mut(&(state["collectionSymbol"].as_str().unwrap().to_string()))
+                        .map(|pools| {
+                            pools.sort_by_key(|p| p["spotPrice"].as_u64().unwrap());
+                            pools.reverse();
+                        });
+                }
+
+                Some("closed") => {
+                    if let Some(pool_addr) = msg["poolAddress"].as_str() {
+                        let is_own_pool = self
+                            .my_bids
+                            .values()
+                            .any(|x| x.as_ref().map(|x| x.1.as_str()) == Some(pool_addr));
+
+                        if is_own_pool {
+                            self.my_bids.retain(|_, data| {
+                                data.as_ref().map(|(_, addr)| addr.as_str()) != Some(pool_addr)
+                            });
+                        } else {
+                            self.cached_pools.values_mut().for_each(|pools| {
+                                pools.retain(|pool| pool["poolKey"].as_str() != Some(pool_addr))
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
-
-            let present_index = self
-                .cached_pools
-                .get(&state.collection_symbol)
-                .and_then(|pools| {
-                    pools
-                        .iter()
-                        .position(|pool| pool["poolKey"].as_str().unwrap() == state.pool_key)
-                });
-
-            match (present_index, new_pool) {
-                (None, None) => return,
-                (Some(i), None) => {
-                    debug!(
-                        "Deleted pool {} from {}",
-                        state.pool_key, state.collection_symbol
-                    );
-                    self.cached_pools
-                        .get_mut(&state.collection_symbol)
-                        .map(|pools| pools.remove(i));
-                }
-                (None, Some(new)) => {
-                    debug!(
-                        "Added pool {} from {}",
-                        state.pool_key, state.collection_symbol
-                    );
-                    self.cached_pools
-                        .entry(state.collection_symbol.clone())
-                        .or_insert_with(Vec::new)
-                        .push(new);
-                }
-                (Some(old), Some(new)) => {
-                    self.cached_pools
-                        .get_mut(&state.collection_symbol)
-                        .map(|pools| pools[old] = new);
-                    debug!(
-                        "Changed pool {} from {}",
-                        state.pool_key, state.collection_symbol
-                    );
-                }
-            }
-
-            self.cached_pools
-                .get_mut(&state.collection_symbol)
-                .map(|pools| pools.sort_by_key(|p| p.spot_price.clone()));
         }
 
-        async fn update_escrow(&mut self) {
-            self.escrow_balance = magic_round_sol(
-                Decimal::from_str(&self.sdk.get_escrow_balance(None).await)
-                    .expect("Failed to parse escrow balance"),
-            );
-        }
-
-        async fn work(&mut self) {
-            let keypair = LocalWallet::from_base58_string(&self.config.pk).unwrap();
-            self.rpc = RpcClient::new(&self.config.rpc, self.config.proxy.clone())
-                .await
-                .unwrap();
-
-            self.sdk = MagicEdenSDK::new(
-                Arc::new(keypair),
-                self.config.impersonate.clone(),
-                self.config.proxy.clone(),
+        async fn get_escrow_balance(sdk: &mut MagicEdenSDK) -> Decimal {
+            magic_round_sol(
+                Decimal::from_f64(
+                    sdk.get_escrow_balance(None).await["balance"]
+                        .as_f64()
+                        .unwrap(),
+                )
+                .expect("Failed to parse escrow balance"),
             )
-            .await
-            .unwrap();
-            self.sdk.auth().await.unwrap();
+        }
 
-            success!(format!("Auth Success for {}!", self.sdk.address));
+        pub async fn work(&mut self) -> anyhow::Result<()> {
+            info!("Starting to work...");
 
-            self.ws = self.sdk.ws().await.unwrap();
-
-            for slug in &self.config.slugs {
-                info!(format!("subcribing for {} collection", slug));
-                let pools = self.sdk.get_pools(slug).await.unwrap();
-                self.cached_pools.insert(slug.clone(), pools);
-                self.ws.subscribe_collection(slug).await.unwrap();
+            while let msg = self.ws.recv().await.unwrap() {
+                self.process_update(&msg);
+                self.rebid_all().await;
             }
 
-            let owned_bids = self.sdk.get_owned_pools().await.unwrap();
+            Ok(())
+        }
+
+        pub async fn new(config: Config) -> anyhow::Result<Self> {
+            let keypair = Arc::new(Keypair::from_base58_string(&config.pk));
+
+            let proxy = config.proxy.clone().map(|x| x.0);
+
+            let mut client = chromimic::ClientBuilder::new()
+                .impersonate(config.impersonate.clone())
+                .danger_accept_invalid_certs(true);
+
+            if let Some(ref proxy_data) = proxy {
+                let mut proxy = chromimic::Proxy::all(format!(
+                    "{}://{}:{}",
+                    proxy_data.kind.to_string(),
+                    proxy_data.addr,
+                    proxy_data.port
+                ))?;
+
+                if let Some((ref login, ref password)) = proxy_data.creds {
+                    proxy = proxy.basic_auth(login, password);
+                }
+
+                client = client.proxy(proxy);
+            }
+
+            let client_rpc = {
+                let mut client = reqwest::ClientBuilder::new();
+
+                if let Some(ref proxy_data) = proxy {
+                    let mut proxy = reqwest::Proxy::all(format!(
+                        "{}://{}:{}",
+                        proxy_data.kind.to_string(),
+                        proxy_data.addr,
+                        proxy_data.port
+                    ))?;
+
+                    if let Some((ref login, ref password)) = proxy_data.creds {
+                        proxy = proxy.basic_auth(login, password);
+                    }
+
+                    client = client.proxy(proxy);
+                }
+
+                client.build()?
+            };
+
+            let rpc_sender = HttpSender::new_with_client(config.rpc.clone(), client_rpc);
+            let rpc = RpcClient::new_sender(
+                rpc_sender,
+                RpcClientConfig {
+                    ..Default::default()
+                },
+            );
+
+            let client = client.build()?;
+
+            let mut sdk = MagicEdenSDK::new(
+                keypair.clone(),
+                client,
+                config.impersonate.clone(),
+                proxy.clone(),
+            );
+            sdk.auth().await;
+
+            // info!("Auth Success for {}!", self.sdk.address);
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            let mut ws = sdk.ws().await;
+
+            let mut cached_pools = HashMap::new();
+            let mut my_bids = HashMap::new();
+
+            for slug in &config.slugs {
+                info!("subcribing for {} collection", slug);
+                let pools = sdk.get_pools(slug).await;
+                cached_pools.insert(slug.clone(), pools["results"].as_array().unwrap().clone());
+                ws.subscribe_collection(slug, "solana").await;
+            }
+
+            let owned_bids = sdk.get_owned_pools(None).await;
+            let owned_bids = owned_bids["results"].as_array().unwrap();
 
             for bid in owned_bids {
-                self.my_bids.insert(
-                    bid.collection_symbol.clone(),
-                    Some(Box {
-                        pool_key: bid.pool_key,
-                        spot_price: magic_round_sol(lamport_to_dec_sol(bid.spot_price)).normalize(),
-                    }),
+                my_bids.insert(
+                    bid["collectionSymbol"].as_str().unwrap().to_string(),
+                    Some((
+                        magic_round_sol(lamport_to_dec_sol(bid["spotPrice"].as_u64().unwrap()))
+                            .normalize(),
+                        bid["poolKey"].as_str().unwrap().to_string(),
+                    )),
                 );
             }
 
-            self.update_escrow().await.unwrap();
+            let escrow = Self::get_escrow_balance(&mut sdk).await;
 
-            let not_yet_set_bids: HashSet<_> = self
-                .config
+            let not_yet_set_bids: HashSet<_> = config
                 .slugs
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>()
-                .difference(&self.my_bids.keys().cloned().collect::<HashSet<_>>())
+                .difference(&my_bids.keys().cloned().collect::<HashSet<_>>())
                 .cloned()
                 .collect();
 
             for slug in not_yet_set_bids {
-                self.my_bids.insert(slug, None);
+                my_bids.insert(slug, None);
             }
 
-            self.rebid_all().await;
+            let mut self_obj = Self {
+                keypair,
+                sdk,
+                ws,
+                rpc,
+                config,
+                my_bids,
+                cached_pools,
+                escrow_balance: escrow,
+            };
 
-            info!("Starting to work...");
+            self_obj.rebid_all().await;
 
-            while let Some(msg) = self.ws.recv().await.unwrap() {
-                self.process_update(&msg);
-                self.rebid_all().await.unwrap();
-            }
+            Ok(self_obj)
         }
     }
 
     fn bid_calculator(
         pools: &[serde_json::Value],
-        min_top_bids: i32,
+        min_top_bids: u32,
         inclusive: bool,
     ) -> Option<Decimal> {
         let mut current_top_bids = 0;
@@ -304,10 +445,11 @@ pub mod bot {
         let mut seen_prices = HashSet::new();
 
         for pool in pools {
-            let sol_rounded_price = magic_round_sol(lamport_to_dec_sol(pool.spot_price));
+            let sol_rounded_price =
+                magic_round_sol(lamport_to_dec_sol(pool["spotPrice"].as_u64().unwrap()));
 
             if !inclusive {
-                current_top_bids += pool.buy_orders_amount;
+                current_top_bids += pool["buyOrdersAmount"].as_u64().unwrap() as u32;
             } else if !seen_prices.contains(&sol_rounded_price) {
                 current_top_bids += 1;
                 seen_prices.insert(sol_rounded_price.clone());
@@ -329,7 +471,7 @@ pub mod bot {
                     last_price
                 } else {
                     let min_sub =
-                        Decimal::from_scientific(&format!("1e{}", last_price.scale())).unwrap();
+                        Decimal::from_scientific(&format!("1e-{}", last_price.scale())).unwrap();
                     magic_round_sol(last_price - min_sub).normalize()
                 }
             }
@@ -337,6 +479,26 @@ pub mod bot {
     }
 }
 
-fn main() {
-    println!("Hello, world!");
+#[derive(serde::Deserialize)]
+pub struct Multiconfig {
+    accounts: Vec<bot::Config>,
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let config: Multiconfig =
+        toml::from_str(&std::fs::read_to_string("config.toml").unwrap()).unwrap();
+
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for account in config.accounts {
+        tasks.spawn(tokio::task::spawn(async move {
+            let mut bot = bot::Bot::new(account).await.unwrap();
+            bot.work().await.unwrap();
+        }).into_future());
+    }
+
+    while let Some(_) = tasks.join_next().await {}
 }
