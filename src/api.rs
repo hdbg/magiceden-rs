@@ -9,6 +9,7 @@ use reqwest::impersonate::Impersonate;
 use rust_decimal::prelude::*;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use solana_sdk::transaction::Transaction;
 use std::sync::Arc;
 use std::time::{self, Duration};
 use tokio::time::sleep;
@@ -16,6 +17,8 @@ use tracing::info;
 use url::Url;
 
 const AUCTION_HOUSE: &str = "E8cU1WiRWjanGxmn96ewBgk9vPTcL6AEZ1t6F6fkgUWe";
+
+pub type TransactionData = (Transaction, solana_sdk::hash::Hash, Option<String>);
 
 pub enum ExpiryTime {
     Hour = 60 * 60,
@@ -30,6 +33,38 @@ use futures::sink::Sink;
 use futures::stream::Stream;
 use futures::{SinkExt, StreamExt};
 
+pub fn magic_round_sol(decimal: Decimal) -> Decimal {
+    let sign = if decimal.abs().is_zero() {
+        Decimal::from(0)
+    } else {
+        decimal / decimal.abs()
+    };
+
+    let decimal = decimal.abs();
+    let dp = cond::cond! {
+        decimal >= Decimal::from(1000) => 0,
+        decimal >= Decimal::from(100) => 1,
+        decimal >= Decimal::from(10) => 2,
+        decimal >= Decimal::from_str("0.01").unwrap() => 3,
+        decimal >= Decimal::from_str("0.001").unwrap() => 4,
+        _ => 5
+    };
+
+    let floored = decimal.floor();
+    let decimal_part = decimal - floored;
+
+    let exponent = Decimal::from_scientific(&format!("1e{}", dp)).unwrap();
+
+    let acceptable_decimal_part = (decimal_part * exponent)
+        .round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        / exponent;
+
+    sign * (floored + acceptable_decimal_part)
+}
+
+pub fn lamport_to_dec_sol(x: u64) -> Decimal {
+    Decimal::from(x) * Decimal::from_scientific("1e-9").unwrap()
+}
 pub struct MagicEdenWS {
     ws: socky::WebSocket,
     ping_interval: tokio::time::Interval,
@@ -41,18 +76,7 @@ impl MagicEdenWS {
     async fn connect(token: String, proxy: Option<Proxy>) -> socky::WebSocket {
         let url = format!("wss://wss-mainnet.magiceden.io/{}", token);
 
-        let ws = match proxy {
-            Some(proxy) => {
-                socky::WebSocket::new_proxy(
-                    proxy,
-                    "wss-mainnet.magiceden.io".to_string(),
-                    443,
-                    url.into_client_request().unwrap(),
-                )
-                .await
-            }
-            None => socky::WebSocket::new(url.into_client_request().unwrap()).await,
-        };
+        let ws = socky::WebSocket::new(url.into_client_request().unwrap(), proxy).await;
 
         return ws.unwrap();
     }
@@ -183,8 +207,6 @@ impl MagicEdenSDK {
             "wallet_name": "Phantom",
         });
 
-        println!("{}", body.to_string());
-
         let resp = self
             .session
             .post("https://api-mainnet.magiceden.io/auth/login/v2/verify?chainId=solana-mainnet")
@@ -207,11 +229,7 @@ impl MagicEdenSDK {
 
         let status = resp.status();
 
-        println!("{:?}", status);
-
         let text = resp.text().await.expect("Failed to parse JSON response");
-
-        println!("{}", text);
 
         let json_resp: serde_json::Value =
             serde_json::from_str(&text).expect("Failed to parse JSON response");
@@ -224,7 +242,6 @@ impl MagicEdenSDK {
 
     pub async fn auth(&mut self) {
         let challenge = self._request_challenge().await;
-        println!("{}", challenge.to_string());
         let challenge_bytes: String = serde_json::from_value(challenge["message"].clone()).unwrap();
         let challenge_bytes = challenge_bytes.as_bytes();
         let signature = self.keypair.sign_message(&challenge_bytes).to_string();
@@ -240,8 +257,6 @@ impl MagicEdenSDK {
         if !auth_result {
             panic!("Unsuccessful authorization");
         }
-
-        println!("{}", token);
 
         self.token = Some(token);
     }
@@ -272,7 +287,6 @@ impl MagicEdenSDK {
     }
 
     async fn get_ws_token(&self) -> String {
-        println!("{}", format!("Bearer {}", self.token.as_ref().unwrap()));
         let resp = self
             .session
             .get("https://api-mainnet.magiceden.io/oauth/encryptedToken")
@@ -296,11 +310,7 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        println!("{:?}", resp.status());
-
         let text = resp.text().await.expect("Failed to parse JSON response");
-
-        println!("{}", text);
 
         let resp_json: serde_json::Value =
             serde_json::from_str(&text).expect("Failed to parse JSON response");
@@ -350,7 +360,7 @@ impl MagicEdenSDK {
         slug: &str,
         spot_price: Decimal,
         expiry: ExpiryTime,
-    ) -> serde_json::Value {
+    ) -> TransactionData {
         let mut params = vec![
             ("curveType", String::from("exp")),
             ("curveDelta", String::from("0")),
@@ -391,7 +401,8 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json = resp.json().await.expect("Failed to parse JSON response");
+        Self::extract_transaction(&resp_json)
     }
 
     pub async fn create_escrow_pool(
@@ -399,7 +410,7 @@ impl MagicEdenSDK {
         slug: &str,
         spot_price: Decimal,
         expiry: ExpiryTime,
-    ) -> serde_json::Value {
+    ) -> TransactionData {
         let mut params = vec![
             ("curveType", String::from("exp")),
             ("curveDelta", String::from("0")),
@@ -441,7 +452,8 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json = resp.json().await.expect("Failed to parse JSON response");
+        Self::extract_transaction(&resp_json)
     }
 
     pub async fn edit_pool_custom(
@@ -449,8 +461,8 @@ impl MagicEdenSDK {
         pool: &str,
         spot_price: Decimal,
         expiry: ExpiryTime,
-    ) -> serde_json::Value {
-        let mut params = vec![
+    ) -> TransactionData {
+        let params = vec![
             ("curveType", String::from("exp")),
             ("curveDelta", String::from("0")),
             ("reinvestBuy", String::from("false")),
@@ -484,7 +496,8 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json = resp.json().await.expect("Failed to parse JSON response");
+        Self::extract_transaction(&resp_json)
     }
 
     pub async fn edit_pool_escrow(
@@ -492,8 +505,8 @@ impl MagicEdenSDK {
         pool: &str,
         spot_price: Decimal,
         expiry: ExpiryTime,
-    ) -> serde_json::Value {
-        let mut params = vec![
+    ) -> TransactionData {
+        let params = vec![
             ("curveType", String::from("exp")),
             ("curveDelta", String::from("0")),
             ("reinvestBuy", String::from("false")),
@@ -528,10 +541,11 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json = resp.json().await.expect("Failed to parse JSON response");
+        Self::extract_transaction(&resp_json)
     }
 
-    pub async fn cancel_offer(&self, pool_key: &str, amount: Decimal) -> serde_json::Value {
+    pub async fn cancel_offer(&self, pool_key: &str, amount: Decimal) -> TransactionData {
         let url = "https://api-mainnet.magiceden.io/v2/instructions/mmm/sol-withdraw-buy";
 
         let resp = self
@@ -546,10 +560,11 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json = resp.json().await.expect("Failed to parse JSON response");
+        Self::extract_transaction(&resp_json)
     }
 
-    pub async fn cancel_offer_escrow(&self, pool_key: &str) -> serde_json::Value {
+    pub async fn cancel_offer_escrow(&self, pool_key: &str) -> TransactionData {
         let url = "https://api-mainnet.magiceden.io/v2/instructions/mmm/sol-close-pool";
 
         let resp = self
@@ -564,7 +579,8 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json = resp.json().await.expect("Failed to parse JSON response");
+        Self::extract_transaction(&resp_json)
     }
 
     fn default_owned_pool_opts() -> serde_json::Value {
@@ -603,7 +619,7 @@ impl MagicEdenSDK {
         resp.json().await.expect("Failed to parse JSON response")
     }
 
-    pub async fn get_escrow_balance(&self, address: Option<String>) -> serde_json::Value {
+    pub async fn get_escrow_balance(&self, address: Option<String>) -> Decimal {
         let address = address.unwrap_or_else(|| self.keypair.pubkey().to_string());
         let url = format!(
             "https://api-mainnet.magiceden.io/v2/wallets/{}/escrow_balance?auctionHouseAddress={}",
@@ -621,6 +637,56 @@ impl MagicEdenSDK {
             .await
             .expect("Failed to send request");
 
-        resp.json().await.expect("Failed to parse JSON response")
+        let resp_json: serde_json::Value =
+            resp.json().await.expect("Failed to parse JSON response");
+        let json_balance = resp_json["balance"].as_f64().unwrap();
+
+        magic_round_sol(Decimal::from_f64(json_balance).unwrap())
+    }
+
+    fn extract_transaction(resp: &serde_json::Value) -> TransactionData {
+        let transaction: Transaction = bincode::deserialize(
+            &resp["txSigned"]["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u8)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        .unwrap();
+        let blockhash =
+            solana_sdk::hash::Hash::from_str(&resp["blockhashData"]["blockhash"].as_str().unwrap())
+                .unwrap();
+        // let blockheight = resp["blockhashData"]["lastValidBlockHeight"]
+        //     .as_u64()
+        //     .unwrap();
+
+        let pool_key = resp
+            .get("poolKey")
+            .and_then(|x| x.as_str())
+            .map(|x| x.to_owned());
+        (transaction, blockhash, pool_key)
+    }
+    pub async fn deposit_escrow(&self, amount: Decimal) -> TransactionData {
+        let url = format!(
+            "https://api-mainnet.magiceden.io/v2/instructions/deposit?auctionHouseAddress={}&buyer={}&amount={}",
+             AUCTION_HOUSE, self.keypair.pubkey().to_string(),amount.normalize().to_string()
+        );
+
+        let resp = self
+            .session
+            .get(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.token.as_ref().unwrap()),
+            )
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        let resp = resp.json().await.expect("Failed to parse JSON response");
+
+        Self::extract_transaction(&resp)
     }
 }
