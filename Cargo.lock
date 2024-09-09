@@ -3138,9 +3138,9 @@ dependencies = [
 
 [[package]]
 name = "proxied"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63007adb30b0b4a5fa69498dd6f2325bcc80193e585766994d2fd91c8ae0c3c8"
+checksum = "9aaed33bc2ac6de67b1d036dbe073ad704feb039b9b4e324b8beae7ccf05f2af"
 dependencies = [
  "async-http-proxy",
  "fast-socks5",
@@ -4200,7 +4200,9 @@ dependencies = [
 
 [[package]]
 name = "socky"
-version = "0.2.2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5deec218ba7b93acf4e2eada5e760d67a420cfdc028457315b29afbf0b9c63bd"
 dependencies = [
  "async-tungstenite",
  "futures-util",
