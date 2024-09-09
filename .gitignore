@@ -1,2 +1,5 @@
 /target
 config.toml
+config*
+new_proxies.txt
+replace_proxies.py

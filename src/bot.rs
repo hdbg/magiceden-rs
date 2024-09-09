@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,11 +7,10 @@ use std::time::Duration;
 use crate::api::*;
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::WebSocketStream;
-use chromimic::boring::x509;
-use chromimic::impersonate::Impersonate;
 use futures::stream::StreamExt;
 use proxied::Proxy;
 use rand::seq::IteratorRandom;
+use rquest::tls::Impersonate;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -25,19 +24,20 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use tokio::task;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 #[serde_with::serde_as]
 #[derive(Deserialize, Debug, Clone)]
 pub struct StrProxy(#[serde_as(as = "DisplayFromStr")] Proxy);
 
-static AUTO_DEPOSIT_RANGE: Range<u64> = (75..88);
+static AUTO_DEPOSIT_RANGE: RangeInclusive<u64> = (89..=92);
 
 use serde_with::{DeserializeFromStr, DisplayFromStr};
 #[serde_with::serde_as]
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, Clone)]
 pub struct Config {
-    pk: String,
+    pub pk: String,
     slugs: Vec<String>,
     #[serde_as(as = "DisplayFromStr")]
     impersonate: Impersonate,
@@ -60,7 +60,7 @@ pub struct Bot {
 }
 
 impl Bot {
-    async fn rebid_all(&mut self) {
+    async fn rebid_all(&mut self) -> anyhow::Result<()> {
         for (slug, pools) in &self.cached_pools {
             let min_top_bids = self.config.min_top_bids;
             let min_top_bids_override = self.config.min_top_bids_override.get(slug);
@@ -84,22 +84,32 @@ impl Bot {
             let (mut transaction, mut blockhash, pool_key) = match (current_bid_value, calc_result)
             {
                 (None, Some(new_bid)) => {
-                    info!("Creating new bid on {} for {}", slug, new_bid);
-                    self.sdk
-                        .create_escrow_pool(slug, new_bid, ExpiryTime::Day)
-                        .await
+                    info!("Creating new bid on {} for {}", slug, new_bid.to_string());
+                    timeout(
+                        Duration::from_secs(60),
+                        self.sdk.create_escrow_pool(slug, new_bid, ExpiryTime::Day),
+                    )
+                    .await??
                 }
+
                 (Some(_), None) => {
                     info!("Cancelling bid on {}", slug);
                     let current_bid = current_bid.as_ref().unwrap();
-                    self.sdk.cancel_offer_escrow(&current_bid.1).await
+                    timeout(
+                        Duration::from_secs(60),
+                        self.sdk.cancel_offer_escrow(&current_bid.1),
+                    )
+                    .await??
                 }
                 (Some(old_bid), Some(new_bid)) => {
                     info!("Changing bid on {} {}=>{}", slug, old_bid.0, new_bid);
                     let current_bid = current_bid.as_ref().unwrap();
-                    self.sdk
-                        .edit_pool_escrow(&current_bid.1, new_bid, ExpiryTime::Day)
-                        .await
+                    timeout(
+                        Duration::from_secs(60),
+                        self.sdk
+                            .edit_pool_escrow(&current_bid.1, new_bid, ExpiryTime::Day),
+                    )
+                    .await??
                 }
                 _ => continue,
             };
@@ -130,6 +140,8 @@ impl Bot {
 
             info!("OK!");
         }
+
+        Ok(())
     }
 
     async fn sign_send_and_confirm_transaction(
@@ -251,9 +263,9 @@ impl Bot {
     pub async fn work(&mut self) -> anyhow::Result<()> {
         info!("Starting to work...");
 
-        while let msg = self.ws.recv().await.unwrap() {
+        while let msg = self.ws.recv().await? {
             self.process_update(&msg);
-            self.rebid_all().await;
+            self.rebid_all().await?;
         }
 
         Ok(())
@@ -264,12 +276,16 @@ impl Bot {
 
         let proxy = config.proxy.clone().map(|x| x.0);
 
-        let mut client = chromimic::ClientBuilder::new()
+        let mut client = rquest::ClientBuilder::new()
             .impersonate(config.impersonate.clone())
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(30))
             .danger_accept_invalid_certs(true);
 
         if let Some(ref proxy_data) = proxy {
-            let mut proxy = chromimic::Proxy::all(format!(
+            // println!("{}", proxy_data);
+
+            let mut proxy = rquest::Proxy::all(format!(
                 "{}://{}:{}",
                 proxy_data.kind.to_string(),
                 proxy_data.addr,
@@ -284,12 +300,12 @@ impl Bot {
         }
 
         let client_rpc = {
-            let mut client = reqwest::ClientBuilder::new();
+            let mut client = solana_client::client_error::reqwest::ClientBuilder::new();
 
             if let Some(ref proxy_data) = proxy {
-                let mut proxy = reqwest::Proxy::all(format!(
-                    "{}://{}:{}",
-                    proxy_data.kind.to_string(),
+                let mut proxy = solana_client::client_error::reqwest::Proxy::all(format!(
+                    "http://{}:{}",
+                    // proxy_data.kind.to_string(),
                     proxy_data.addr,
                     proxy_data.port
                 ))?;
@@ -301,7 +317,7 @@ impl Bot {
                 client = client.proxy(proxy);
             }
 
-            client.build()?
+            client.timeout(Duration::from_secs(60)).build()?
         };
 
         let rpc_sender = HttpSender::new_with_client(config.rpc.clone(), client_rpc);
@@ -320,49 +336,56 @@ impl Bot {
             config.impersonate.clone(),
             proxy.clone(),
         );
-        sdk.auth().await;
+        timeout(Duration::from_secs(120), sdk.auth()).await??;
 
-        // info!("Auth Success for {}!", self.sdk.address);
+        info!(event = "auth.ok", addr = sdk.address());
 
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        let mut ws = sdk.ws().await;
+        let mut ws = sdk.ws().await?;
 
         let mut cached_pools = HashMap::new();
         let mut my_bids = HashMap::new();
-        let mut escrow = sdk.get_escrow_balance(None).await;
+        let mut escrow = sdk.get_escrow_balance(None).await?;
+        let balance_decimal = magic_round_sol(lamport_to_dec_sol(
+            rpc.get_balance(&keypair.pubkey()).await?,
+        ));
 
-        if escrow.is_zero() {
+        if balance_decimal > escrow && balance_decimal > Decimal::from_str("0.01").unwrap() {
             let top_up_percent = AUTO_DEPOSIT_RANGE
                 .clone()
                 .choose(&mut rand::thread_rng())
                 .unwrap();
-            let as_decimal = rpc.get_balance(&keypair.pubkey()).await.unwrap();
 
-            let as_decimal = magic_round_sol(lamport_to_dec_sol(as_decimal))
-                * (Decimal::from(1) - (Decimal::from(top_up_percent) / Decimal::from(100)));
+            let as_decimal = balance_decimal
+                * (Decimal::from(1)
+                    - ((Decimal::from(100) - Decimal::from(top_up_percent)) / Decimal::from(100)));
             info!("topping up escrow by {} SOL", as_decimal);
 
-            let (transaction, blockhash, _) = sdk.deposit_escrow(as_decimal).await;
+            let (transaction, blockhash, _) =
+                timeout(Duration::from_secs(60), sdk.deposit_escrow(as_decimal)).await??;
 
             Self::sign_send_and_confirm_transaction(&keypair, transaction, blockhash, &rpc).await;
 
-            while sdk.get_escrow_balance(None).await.is_zero() {
+            while sdk.get_escrow_balance(None).await?.is_zero() {
                 tokio::time::sleep(Duration::from_secs(5)).await
             }
 
-            escrow = sdk.get_escrow_balance(None).await;
-            info!("OK");
+            escrow = sdk.get_escrow_balance(None).await?;
+            info!(
+                event = "balance.topped_up",
+                for_sol = as_decimal.to_string()
+            );
         }
 
         for slug in &config.slugs {
-            info!("subcribing for {} collection", slug);
-            let pools = sdk.get_pools(slug).await;
+            info!(event = "collection.sub", slug = slug);
+            let pools = sdk.get_pools(slug).await?;
             cached_pools.insert(slug.clone(), pools["results"].as_array().unwrap().clone());
             ws.subscribe_collection(slug, "solana").await;
         }
 
-        let owned_bids = sdk.get_owned_pools(None).await;
+        let owned_bids = sdk.get_owned_pools(None).await?;
         let owned_bids = owned_bids["results"].as_array().unwrap();
 
         for bid in owned_bids {
@@ -400,7 +423,7 @@ impl Bot {
             escrow_balance: escrow,
         };
 
-        self_obj.rebid_all().await;
+        self_obj.rebid_all().await?;
 
         Ok(self_obj)
     }
