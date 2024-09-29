@@ -651,7 +651,17 @@ impl MagicEdenSDK {
         let endpoint = "https://api-mainnet.magiceden.io/v2/mmm/pools";
 
         let owner = owner.unwrap_or_else(|| self.keypair.pubkey().to_string());
-        let mut params = Self::default_pool_opts();
+        let mut params = serde_json::json!({
+            "offset": 0,
+            "limit": 150,
+            "filterOnSide": 1,
+            "hideExpired": false,
+            "showInvalid": true,
+            "fundingMode": 0,
+            "direction": 1,
+            "field": 5,
+            "attributesMode":1
+        });
         params["owner"] = serde_json::json!(owner);
 
         let resp = self

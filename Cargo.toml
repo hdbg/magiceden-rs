@@ -7,13 +7,12 @@ edition = "2021"
 anyhow = { version = "1.0.86", features = ["backtrace"] }
 async-tungstenite = { version = "0.23", features = ["tokio", "tokio-runtime", "tokio-rustls-webpki-roots"] }
 bincode = "1.3.3"
-rquest  = { version = "0.20", features = ["json", "socks", "cookies", "brotli", "deflate", "gzip", "zstd"] }
+rquest  = { version = "0.21", features = ["json", "socks", "cookies", "brotli", "deflate", "gzip", "zstd"] }
 chrono = "0.4.38"
 cond = "1.0.5"
-console-subscriber = "0.4.0"
+# console-subscriber = "0.4.0"
 futures = "0.3.30"
-openssl = { version = "0.10.64", features = ["vendored"] }
-proxied = "0.3.5"
+proxied = "0.3.6"
 rand = "0.8.5"
 reqwest = { version = "0", features = ["socks"] }
 rust_decimal = "1.35.0"
@@ -32,6 +31,7 @@ tracing = "0.1.40"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url = "2.5.1"
+openssl = { version = "0.10.66", features = ["vendored"] }
 [patch.crates-io.aes-gcm-siv]
 git = "https://github.com/RustCrypto/AEADs"
 rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"

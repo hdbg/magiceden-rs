@@ -1,3 +1,5 @@
+use rand::prelude::*;
+use rand::RngCore;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 use std::str::FromStr;
@@ -45,7 +47,7 @@ pub struct Config {
     rpc: String,
     inclusive: bool,
     min_top_bids_override: HashMap<String, u32>,
-    proxy: Option<StrProxy>,
+    pub proxy: Option<StrProxy>,
 }
 
 pub struct Bot {
@@ -114,6 +116,8 @@ impl Bot {
                 _ => continue,
             };
 
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
             Self::sign_send_and_confirm_transaction(
                 &self.keypair,
                 transaction,
@@ -138,7 +142,7 @@ impl Bot {
                 }
             }
 
-            info!("OK!");
+            info!(event = "OK!", wallet = self.keypair.pubkey().to_string());
         }
 
         Ok(())
@@ -271,8 +275,10 @@ impl Bot {
         Ok(())
     }
 
-    pub async fn new(config: Config) -> anyhow::Result<Self> {
+    pub async fn new(mut config: Config) -> anyhow::Result<Self> {
         let keypair = Arc::new(Keypair::from_base58_string(&config.pk));
+
+        println!("{:#?}", keypair.pubkey());
 
         let proxy = config.proxy.clone().map(|x| x.0);
 
@@ -351,6 +357,13 @@ impl Bot {
             rpc.get_balance(&keypair.pubkey()).await?,
         ));
 
+        println!(
+            "[{}]: Escrow = {}, SOL = {}",
+            keypair.pubkey(),
+            escrow.to_string(),
+            balance_decimal.to_string()
+        );
+
         if balance_decimal > escrow && balance_decimal > Decimal::from_str("0.01").unwrap() {
             let top_up_percent = AUTO_DEPOSIT_RANGE
                 .clone()
@@ -376,13 +389,18 @@ impl Bot {
                 event = "balance.topped_up",
                 for_sol = as_decimal.to_string()
             );
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
+
+        config.slugs.shuffle(&mut rand::thread_rng());
 
         for slug in &config.slugs {
             info!(event = "collection.sub", slug = slug);
             let pools = sdk.get_pools(slug).await?;
             cached_pools.insert(slug.clone(), pools["results"].as_array().unwrap().clone());
             ws.subscribe_collection(slug, "solana").await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
         let owned_bids = sdk.get_owned_pools(None).await?;

@@ -1,4 +1,4 @@
-use console_subscriber::ConsoleLayer;
+// use console_subscriber::ConsoleLayer;
 use std::{convert::Infallible, future::IntoFuture, time::Duration};
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -20,12 +20,15 @@ async fn worker(account: bot::Config) -> Infallible {
             Ok(bot) => bot,
             Err(err) => {
                 println!("{:?}", err);
+                println!("{:#?}", &account.proxy);
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
         };
         if let error @ Err(_) = bot.work().await {
             println!("{:?}", error);
+            println!("{:#?}", &account.proxy);
+
             tokio::time::sleep(Duration::from_secs(10)).await;
 
             continue;
@@ -42,9 +45,9 @@ async fn main() {
     let formatting_layer = tracing_subscriber::fmt::layer().with_writer(non_blocking);
 
     // Combine the layers into a subscriber
-    let console_sub = console_subscriber::spawn();
+    // let console_sub = console_subscriber::spawn();
     let subscriber = Registry::default()
-        .with(console_sub)
+        // .with(console_sub)
         .with(env_filter)
         .with(formatting_layer);
 
@@ -59,10 +62,11 @@ async fn main() {
         tasks.spawn(worker(account));
         tokio::task::yield_now().await;
 
-        // tokio::time::sleep(Duration::from_secs(
-        //     (1..20).choose(&mut rand::thread_rng()).unwrap(),
-        // ))
-        // .await;
+        #[cfg(not(debug_assertions))]
+        tokio::time::sleep(Duration::from_secs(
+            (1..20).choose(&mut rand::thread_rng()).unwrap(),
+        ))
+        .await;
     }
 
     tracing::info!(event = "spawn.done");
