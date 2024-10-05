@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use async_tungstenite::tokio::TokioAdapter;
 use async_tungstenite::tungstenite::client::IntoClientRequest;
 use async_tungstenite::tungstenite::Message;
@@ -114,7 +114,7 @@ impl MagicEdenWS {
             tokio::select! {
                 _ = self.ping_interval.tick() => {
                     if let Err(err) = self.ws.send(Message::Text("[\"pong\"]".to_string())).await {
-                        panic!("Failed to send ping message: {:?}", err);
+                        bail!("Failed to send ping message: {:?}", err);
                     }
                 }
                 _ = socket_ping_interval.tick() => {

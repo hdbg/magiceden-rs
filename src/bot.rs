@@ -1,5 +1,7 @@
+use chrono::Utc;
 use rand::prelude::*;
 use rand::RngCore;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 use std::str::FromStr;
@@ -50,19 +52,53 @@ pub struct Config {
     pub proxy: Option<StrProxy>,
 }
 
+pub type BidKey = String;
+
 pub struct Bot {
     keypair: Arc<Keypair>,
     sdk: MagicEdenSDK,
     ws: MagicEdenWS,
     rpc: RpcClient,
     config: Config,
-    my_bids: HashMap<String, Option<(Decimal, String)>>,
+    my_bids: HashMap<String, Option<(Decimal, BidKey, serde_json::Value)>>,
     cached_pools: HashMap<String, Vec<serde_json::Value>>,
     escrow_balance: Decimal,
 }
 
 impl Bot {
     async fn rebid_all(&mut self) -> anyhow::Result<()> {
+        for (_, bid) in self.my_bids.iter_mut() {
+            if let Some((_, bid_key, value)) = bid {
+                if let Some(unix_epoch) = value.get("expiry").and_then(Value::as_i64) {
+                    if chrono::DateTime::from_timestamp(unix_epoch, 0)
+                        .is_some_and(|x| Utc::now() > x)
+                    {
+                        // should cancel
+
+                        let _ = timeout(
+                            Duration::from_secs(60),
+                            self.sdk.cancel_offer_escrow(&bid_key),
+                        )
+                        .await??;
+
+                        *bid = None;
+                    }
+                }
+            }
+        }
+        // self.my_bids.retain(|_, bid_data| {
+        //     if let Some((_, _, value)) = bid_data {
+        //            if let Some(unix_epoch) = value.get("expiry").and_then(Value::as_u64) {
+
+        //                if chrono::DateTime::from_timestamp(unix_epoch, 0).is_some_and(|x| Utc::now() > x) {
+        //                    /// should cancel
+        //                }
+        //            }
+
+        //     }
+        //     true
+        // });
+
         for (slug, pools) in &self.cached_pools {
             let min_top_bids = self.config.min_top_bids;
             let min_top_bids_override = self.config.min_top_bids_override.get(slug);
@@ -83,10 +119,12 @@ impl Bot {
                 continue;
             }
 
+            let mut expiry_time = None;
             let (mut transaction, mut blockhash, pool_key) = match (current_bid_value, calc_result)
             {
                 (None, Some(new_bid)) => {
                     info!("Creating new bid on {} for {}", slug, new_bid.to_string());
+                    expiry_time = Some((Utc::now() + chrono::TimeDelta::days(1)).timestamp());
                     timeout(
                         Duration::from_secs(60),
                         self.sdk.create_escrow_pool(slug, new_bid, ExpiryTime::Day),
@@ -106,6 +144,8 @@ impl Bot {
                 (Some(old_bid), Some(new_bid)) => {
                     info!("Changing bid on {} {}=>{}", slug, old_bid.0, new_bid);
                     let current_bid = current_bid.as_ref().unwrap();
+                    expiry_time = Some((Utc::now() + chrono::TimeDelta::days(1)).timestamp());
+
                     timeout(
                         Duration::from_secs(60),
                         self.sdk
@@ -129,7 +169,11 @@ impl Bot {
             if let Some(pool_key) = pool_key {
                 self.my_bids.insert(
                     slug.clone(),
-                    Some((calc_result.unwrap(), pool_key.to_string())),
+                    Some((
+                        calc_result.unwrap(),
+                        pool_key.to_string(),
+                        serde_json::json!({"expiry": expiry_time}),
+                    )),
                 );
             } else {
                 match calc_result {
@@ -251,7 +295,7 @@ impl Bot {
 
                     if is_own_pool {
                         self.my_bids.retain(|_, data| {
-                            data.as_ref().map(|(_, addr)| addr.as_str()) != Some(pool_addr)
+                            data.as_ref().map(|(_, addr, _)| addr.as_str()) != Some(pool_addr)
                         });
                     } else {
                         self.cached_pools.values_mut().for_each(|pools| {
@@ -413,6 +457,7 @@ impl Bot {
                     magic_round_sol(lamport_to_dec_sol(bid["spotPrice"].as_u64().unwrap()))
                         .normalize(),
                     bid["poolKey"].as_str().unwrap().to_string(),
+                    bid.clone(),
                 )),
             );
         }

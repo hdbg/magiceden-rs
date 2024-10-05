@@ -1,5 +1,10 @@
 // use console_subscriber::ConsoleLayer;
-use std::{convert::Infallible, future::IntoFuture, time::Duration};
+use std::{
+    convert::Infallible,
+    future::IntoFuture,
+    sync::atomic::{AtomicI64, Ordering},
+    time::Duration,
+};
 use tracing_subscriber::{filter::EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use rand::seq::IteratorRandom;
@@ -14,7 +19,7 @@ pub struct Multiconfig {
     accounts: Vec<bot::Config>,
 }
 
-async fn worker(account: bot::Config) -> Infallible {
+async fn worker(account: bot::Config, counter: &'static AtomicI64) -> Infallible {
     loop {
         let mut bot = match bot::Bot::new(account.clone()).await {
             Ok(bot) => bot,
@@ -25,14 +30,18 @@ async fn worker(account: bot::Config) -> Infallible {
                 continue;
             }
         };
+
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let error @ Err(_) = bot.work().await {
             println!("{:?}", error);
             println!("{:#?}", &account.proxy);
 
             tokio::time::sleep(Duration::from_secs(10)).await;
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             continue;
         }
+        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -58,8 +67,19 @@ async fn main() {
 
     let mut tasks = tokio::task::JoinSet::new();
 
+    let counter = std::sync::atomic::AtomicI64::new(0);
+
+    let static_counter: &'static _ = Box::leak(Box::new(counter));
+
+    let _report_task = tokio::task::spawn(async {
+        loop {
+            println!("Total running: {}", static_counter.load(Ordering::Relaxed));
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+
     for account in config.accounts {
-        tasks.spawn(worker(account));
+        tasks.spawn(worker(account, static_counter));
         tokio::task::yield_now().await;
 
         #[cfg(not(debug_assertions))]
